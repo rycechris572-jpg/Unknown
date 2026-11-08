@@ -1,2 +1,1 @@
-# Unknown
-Unknow buffer
+Doesn't matter if Click Between Frames is on.
