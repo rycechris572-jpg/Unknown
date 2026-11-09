@@ -9,6 +9,9 @@
 #include <Windows.h>
 #include <cstdio>
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <chrono>
 
 using namespace geode::prelude;
@@ -38,6 +41,12 @@ static void refreshBufferHud();
 
 class TrajectoryBufferSim {
 private:
+    struct PendingInput {
+        bool push = false;
+        std::uint64_t dueTick = 0;
+    };
+    static constexpr std::size_t PENDING_INPUT_CAPACITY = 32;
+
     PlayerObject* m_simPlayer1 = nullptr;
     PlayerObject* m_simPlayer2 = nullptr;
 
@@ -55,10 +64,17 @@ private:
     int  m_maxTicksNormal = 2;
     int  m_maxTicksWave = 2;
 
-    // Buffer state
-    int  m_waitTicks = -1;          // -1 = inactive, >= 0 = countdown ticks, -2 = queued opposite tick
-    bool m_bufferedPush = true;     // true = buffered PRESS, false = buffered RELEASE
-    bool m_queuedOpposite = false;  // true if user quickly released/re-pressed during wait
+    // Tick-based input scheduling. The first predicted edge has its own due tick;
+    // later physical edges are stored in order and dispatched at least one tick apart.
+    std::uint64_t m_engineTick = 0;
+    bool m_primaryPending = false;
+    std::uint64_t m_primaryDueTick = 0;
+    bool m_bufferedPush = true;
+    std::array<PendingInput, PENDING_INPUT_CAPACITY> m_pendingInputs{};
+    std::size_t m_pendingHead = 0;
+    std::size_t m_pendingCount = 0;
+    bool m_hasQueuedPhysicalState = false;
+    bool m_lastQueuedPhysicalState = false;
     float m_frameDt = 0.25f;        // GD 240 TPS normalized dt is 0.25f
 
     // Streak-based Spam Guard state
@@ -70,6 +86,65 @@ private:
     Clock::time_point m_predictionDeadline{};
     bool m_predictionBudgetExceeded = false;
     ULONGLONG m_lastSaveLogMs = 0;
+
+    bool hasPendingInputs() const {
+        return m_primaryPending || m_pendingCount > 0;
+    }
+
+    void clearPendingInputs() {
+        m_primaryPending = false;
+        m_primaryDueTick = 0;
+        m_pendingHead = 0;
+        m_pendingCount = 0;
+        m_hasQueuedPhysicalState = false;
+    }
+
+    // Returns false only when the bounded queue is full. Repeated identical
+    // states are coalesced because they are not new press/release edges.
+    bool queuePhysicalInput(bool push) {
+        if (!m_hasQueuedPhysicalState) {
+            m_lastQueuedPhysicalState = m_primaryPending ? m_bufferedPush : m_gameHolding;
+            m_hasQueuedPhysicalState = true;
+        }
+        if (push == m_lastQueuedPhysicalState) return true;
+        if (m_pendingCount >= PENDING_INPUT_CAPACITY) return false;
+
+        std::uint64_t dueTick = m_engineTick + 1;
+        if (m_primaryPending) {
+            dueTick = std::max(dueTick, m_primaryDueTick + 1);
+        }
+        if (m_pendingCount > 0) {
+            const std::size_t lastIndex =
+                (m_pendingHead + m_pendingCount - 1) % PENDING_INPUT_CAPACITY;
+            dueTick = std::max(dueTick, m_pendingInputs[lastIndex].dueTick + 1);
+        }
+
+        const std::size_t tail =
+            (m_pendingHead + m_pendingCount) % PENDING_INPUT_CAPACITY;
+        m_pendingInputs[tail] = PendingInput{push, dueTick};
+        ++m_pendingCount;
+        m_lastQueuedPhysicalState = push;
+        return true;
+    }
+
+    // Overflow and mode-transition fallback: replay everything already
+    // intercepted in original order, then let the caller reconcile the newest
+    // physical state. This avoids silently losing a press or release.
+    void flushPendingInputsImmediately(PlayLayer* pl) {
+        if (!pl) return;
+        if (m_primaryPending) {
+            m_SimFireButton(pl, m_bufferedPush);
+            m_primaryPending = false;
+        }
+        while (m_pendingCount > 0) {
+            const PendingInput next = m_pendingInputs[m_pendingHead];
+            m_pendingHead = (m_pendingHead + 1) % PENDING_INPUT_CAPACITY;
+            --m_pendingCount;
+            m_SimFireButton(pl, next.push);
+        }
+        m_pendingHead = 0;
+        m_hasQueuedPhysicalState = false;
+    }
 
     PlayerObject* createTrajectoryPlayer() {
         PlayLayer* pl = PlayLayer::get();
@@ -119,8 +194,8 @@ public:
 
         m_simPlayer1 = createTrajectoryPlayer();
         m_simPlayer2 = createTrajectoryPlayer();
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
+        m_engineTick = 0;
+        clearPendingInputs();
         m_physicalHolding = false;
         m_gameHolding = false;
         m_simulating = false;
@@ -140,8 +215,7 @@ public:
         }
         m_simulating = false;
         m_firingBuffered = false;
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
+        clearPendingInputs();
         m_rapidInputStreak = 0;
     }
 
@@ -149,8 +223,7 @@ public:
     // Single-value presets use the same tick limit for normal and wave.
     void cyclePreset() {
         m_presetIndex = (m_presetIndex + 1) % 10;
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
+        if (hasPendingInputs()) flushPendingInputsImmediately(PlayLayer::get());
 
         constexpr int normalTicks[] = {2, 4, 8, 16, 24, 32, 48, 54, 60, 0};
         constexpr int waveTicks[]   = {2, 4, 8,  8, 24, 32, 48, 54, 60, 0};
@@ -178,8 +251,7 @@ public:
             return true;
         }
         // Real player died -> clear any pending buffer so respawn is 100% clean
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
+        clearPendingInputs();
         m_gameHolding = false;
         m_rapidInputStreak = 0;
         return false;
@@ -299,7 +371,7 @@ public:
 
         // Keep Player 2 synced with Player 1 in 1-player Dual mode
         if (!isPlayer1) {
-            if (isDual && !isTwoPlayerControl && (m_waitTicks >= 0 || m_waitTicks == -2)) {
+            if (isDual && !isTwoPlayerControl && hasPendingInputs()) {
                 return false;
             }
             return true;
@@ -316,40 +388,32 @@ public:
         PlayerObject* p1 = layer->m_player1;
         PlayerObject* p2 = isDual ? pl->m_player2 : nullptr;
         if (!p1 || p1->m_isDead) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
+            clearPendingInputs();
             m_gameHolding = push;
             return true;
         }
 
         // 1. NEVER touch Ship mode (or Dual with Ship)
         if (p1->m_isShip || (isDual && p2 && p2->m_isShip)) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
+            if (hasPendingInputs()) {
+                flushPendingInputsImmediately(pl);
+                if (m_gameHolding != push) m_SimFireButton(pl, push);
+                return false;
+            }
             m_gameHolding = push;
             return true;
         }
 
-        // 2. If an input is currently waiting in the buffer and the user quickly releases
-        // (or re-presses) 1-2 ticks later, queue it for the next tick so fast taps are never eaten
-        if (m_waitTicks >= 0) {
-            if (push != m_bufferedPush) {
-                m_queuedOpposite = true;
-            } else {
-                m_queuedOpposite = false;
+        // 2. While a predicted edge is pending, preserve every new physical
+        // transition in order rather than collapsing the sequence into one flag.
+        if (hasPendingInputs()) {
+            if (!queuePhysicalInput(push)) {
+                // Bounded-queue overflow fails open without silently dropping edges.
+                flushPendingInputsImmediately(pl);
+                if (m_gameHolding != push) m_SimFireButton(pl, push);
             }
             m_ticksSinceLastInput = 0;
             return false;
-        }
-
-        // If a queued opposite action is due to fire on the next tick (m_waitTicks == -2)
-        // and the user clicks again, fire the pending opposite action first
-        if (m_waitTicks == -2) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
-            if (m_gameHolding != !m_bufferedPush) {
-                m_SimFireButton(pl, !m_bufferedPush);
-            }
         }
 
         bool isWave = p1->m_isDart || (isDual && p2 && p2->m_isDart);
@@ -379,7 +443,6 @@ public:
             return true;
         }
 
-        m_queuedOpposite = false;
         const char* act = push ? "PRESS" : "RELEASE";
 
         // Full Show-Trajectory lookahead for Wave (65 ticks / 50 ticks Mini Wave)
@@ -464,7 +527,10 @@ public:
                 m_lastSaveLogMs = nowMs;
             }
             m_bufferedPush = push;
-            m_waitTicks = bestDelay;
+            m_primaryPending = true;
+            m_primaryDueTick = m_engineTick + static_cast<std::uint64_t>(bestDelay) + 1;
+            m_lastQueuedPhysicalState = push;
+            m_hasQueuedPhysicalState = true;
             return false;
         }
 
@@ -476,44 +542,53 @@ public:
         PlayLayer* pl = PlayLayer::get();
         if (!pl || player != pl->m_player1) return;
 
+        ++m_engineTick;
+
         // Check F6 before m_enabled check so you can always cycle back ON when it is OFF!
         if (GetAsyncKeyState(VK_F6) & 1) {
             cyclePreset();
             refreshBufferHud();
         }
 
-        if (!m_enabled) return;
-
-        if (m_ticksSinceLastInput < 999) {
-            m_ticksSinceLastInput++;
-        }
-
-        if (player->m_isShip || (pl->m_gameState.m_isDualMode && pl->m_player2 && pl->m_player2->m_isShip)) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
+        if (!m_enabled) {
+            if (hasPendingInputs()) flushPendingInputsImmediately(pl);
             if (m_gameHolding != m_physicalHolding) {
                 m_SimFireButton(pl, m_physicalHolding);
             }
             return;
         }
 
-        if (m_waitTicks == 0) {
-            m_SimFireButton(pl, m_bufferedPush);
-            if (m_queuedOpposite) {
-                m_waitTicks = -2;
-                m_queuedOpposite = false;
-            } else {
-                m_waitTicks = -1;
+        if (m_ticksSinceLastInput < 999) {
+            m_ticksSinceLastInput++;
+        }
+
+        if (player->m_isShip || (pl->m_gameState.m_isDualMode && pl->m_player2 && pl->m_player2->m_isShip)) {
+            if (hasPendingInputs()) flushPendingInputsImmediately(pl);
+            if (m_gameHolding != m_physicalHolding) {
+                m_SimFireButton(pl, m_physicalHolding);
             }
-        } else if (m_waitTicks > 0) {
-            m_waitTicks--;
-        } else if (m_waitTicks == -2) {
-            m_SimFireButton(pl, !m_bufferedPush);
-            m_queuedOpposite = false;
-            m_waitTicks = -1;
-        } else if (m_waitTicks == -1) {
-            // FAILSAFE: When no buffer is active, guarantee the game's hold state
-            // matches your actual physical mouse button so Wave/Mini Wave can NEVER stay stuck holding!
+            return;
+        }
+
+        // Dispatch at most one queued edge per game tick. Due ticks are strictly
+        // increasing, so rapid press/release sequences cannot reorder or collapse.
+        if (m_primaryPending && m_engineTick >= m_primaryDueTick) {
+            m_SimFireButton(pl, m_bufferedPush);
+            m_primaryPending = false;
+        }
+
+        if (!m_primaryPending && m_pendingCount > 0) {
+            const PendingInput next = m_pendingInputs[m_pendingHead];
+            if (m_engineTick >= next.dueTick) {
+                m_pendingHead = (m_pendingHead + 1) % PENDING_INPUT_CAPACITY;
+                --m_pendingCount;
+                m_SimFireButton(pl, next.push);
+            }
+        }
+
+        if (!hasPendingInputs()) {
+            m_hasQueuedPhysicalState = false;
+            // FAILSAFE: the game's hold state must match the physical button state.
             if (m_gameHolding != m_physicalHolding) {
                 m_SimFireButton(pl, m_physicalHolding);
             }
