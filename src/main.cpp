@@ -9,6 +9,7 @@
 #include <Windows.h>
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 
 using namespace geode::prelude;
 
@@ -21,6 +22,15 @@ using namespace geode::prelude;
 // This keeps isolated micro-clicks and spike/sawblade dodges 100% protected!
 constexpr int SPAM_INTERVAL_TICKS = 8;
 constexpr int SPAM_STREAK_REQUIRED = 3;
+
+// Hard ceiling for every preset and every prediction scan.
+constexpr int MAX_BUFFER_TICKS = 60;
+
+// A small per-search CPU budget plus a cooldown prevents rapid inputs from
+// repeatedly launching expensive trajectory sweeps on the game thread.
+constexpr auto PREDICTION_BUDGET = std::chrono::microseconds(2500);
+constexpr auto PREDICTION_COOLDOWN = std::chrono::milliseconds(20);
+constexpr ULONGLONG SAVE_LOG_INTERVAL_MS = 250;
 
 // ============================================================================
 
@@ -54,6 +64,12 @@ private:
     // Streak-based Spam Guard state
     int  m_ticksSinceLastInput = 999;
     int  m_rapidInputStreak = 0;
+
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point m_nextPredictionAllowed{};
+    Clock::time_point m_predictionDeadline{};
+    bool m_predictionBudgetExceeded = false;
+    ULONGLONG m_lastSaveLogMs = 0;
 
     PlayerObject* createTrajectoryPlayer() {
         PlayLayer* pl = PlayLayer::get();
@@ -129,24 +145,24 @@ public:
         m_rapidInputStreak = 0;
     }
 
-    // F6 cycles through 10 buffer presets and OFF.
+    // F6 cycles through nine buffer presets (capped at 60) and OFF.
     // Single-value presets use the same tick limit for normal and wave.
     void cyclePreset() {
-        m_presetIndex = (m_presetIndex + 1) % 11;
+        m_presetIndex = (m_presetIndex + 1) % 10;
         m_waitTicks = -1;
         m_queuedOpposite = false;
 
-        constexpr int normalTicks[] = {2, 4, 8, 16, 24, 32, 48, 54, 60, 120, 0};
-        constexpr int waveTicks[]   = {2, 4, 8,  8, 24, 32, 48, 54, 60, 120, 0};
-        m_enabled = m_presetIndex != 10;
-        m_maxTicksNormal = normalTicks[m_presetIndex];
-        m_maxTicksWave = waveTicks[m_presetIndex];
+        constexpr int normalTicks[] = {2, 4, 8, 16, 24, 32, 48, 54, 60, 0};
+        constexpr int waveTicks[]   = {2, 4, 8,  8, 24, 32, 48, 54, 60, 0};
+        m_enabled = m_presetIndex != 9;
+        m_maxTicksNormal = std::clamp(normalTicks[m_presetIndex], 0, MAX_BUFFER_TICKS);
+        m_maxTicksWave = std::clamp(waveTicks[m_presetIndex], 0, MAX_BUFFER_TICKS);
 
         if (m_enabled) {
             printf("[InputBuffer] F6 Cycle -> STAGE %d: %d Ticks All | %d Ticks Wave\n",
                    m_presetIndex + 1, m_maxTicksNormal, m_maxTicksWave);
         } else {
-            printf("[InputBuffer] F6 Cycle -> STAGE 11: OFF (100%% Raw Input)\n");
+            printf("[InputBuffer] F6 Cycle -> STAGE 10: OFF (100%% Raw Input)\n");
         }
     }
 
@@ -212,6 +228,13 @@ public:
         int safeLandedTicks = 0;
 
         for (int i = 0; i < delayFrames + maxTicks; i++) {
+            // Check every four simulated ticks to keep the guard inexpensive.
+            if ((i & 3) == 0 && Clock::now() >= m_predictionDeadline) {
+                m_predictionBudgetExceeded = true;
+                m_simulating = false;
+                return -1;
+            }
+
             if (i == delayFrames) {
                 if (actionPush) {
                     m_simPlayer1->pushButton(PlayerButton::Jump);
@@ -362,10 +385,28 @@ public:
         // Full Show-Trajectory lookahead for Wave (65 ticks / 50 ticks Mini Wave)
         // so it sees spikes and sawblades 1-3 blocks ahead along the diagonal path!
         int targetHorizon = isMiniWave ? 50 : (isWave ? 65 : 160);
-        int maxDelayFrames = isWave ? m_maxTicksWave : m_maxTicksNormal;
+        int maxDelayFrames = std::clamp(
+            isWave ? m_maxTicksWave : m_maxTicksNormal, 0, MAX_BUFFER_TICKS
+        );
 
-        // 4. Check Frame 0 (immediate input) across the full trajectory horizon
+        // Never let a burst of physical inputs trigger an unbounded number of
+        // prediction sweeps. Inputs inside the cooldown pass through immediately.
+        const auto predictionStart = Clock::now();
+        if (predictionStart < m_nextPredictionAllowed) {
+            m_gameHolding = push;
+            return true;
+        }
+        m_nextPredictionAllowed = predictionStart + PREDICTION_COOLDOWN;
+        m_predictionDeadline = predictionStart + PREDICTION_BUDGET;
+        m_predictionBudgetExceeded = false;
+
+        // 4. Check Frame 0 (immediate input) across the full trajectory horizon.
+        // If the CPU budget expires, fail open: preserve the input without buffering.
         int ticksFrame0 = getSurvivalTicks(pl, p1, p2, isDual, 0, push, targetHorizon);
+        if (ticksFrame0 < 0 || m_predictionBudgetExceeded) {
+            m_gameHolding = push;
+            return true;
+        }
         if (ticksFrame0 >= targetHorizon) {
             m_gameHolding = push;
             return true;
@@ -378,6 +419,11 @@ public:
 
         for (int delay = 1; delay <= maxDelayFrames; delay++) {
             int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
+            if (ticks < 0 || m_predictionBudgetExceeded) {
+                // Do not use a partial scan to make a buffering decision.
+                m_gameHolding = push;
+                return true;
+            }
 
             if (isWave) {
                 // In Wave mode, delaying a turn inside a flat corridor naturally adds ~(2 * delay)
@@ -409,8 +455,14 @@ public:
         }
 
         if (bestDelay > 0) {
-            printf("[InputBuffer] *** SAVED +%d TICKS (%.2f frames @ 60fps) %s! (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
-                bestDelay, bestDelay / 4.0f, act, ticksFrame0, bestTicks, maxDelayFrames);
+            // Console output is synchronous; throttle it so rapid gameplay spam
+            // cannot stall the game while Windows flushes the console stream.
+            const ULONGLONG nowMs = GetTickCount64();
+            if (m_lastSaveLogMs == 0 || nowMs - m_lastSaveLogMs >= SAVE_LOG_INTERVAL_MS) {
+                printf("[InputBuffer] *** SAVED +%d TICKS (%.2f frames @ 60fps) %s! (Frame0: %d -> Delayed: %d) [Limit: %d] ***\n",
+                    bestDelay, bestDelay / 4.0f, act, ticksFrame0, bestTicks, maxDelayFrames);
+                m_lastSaveLogMs = nowMs;
+            }
             m_bufferedPush = push;
             m_waitTicks = bestDelay;
             return false;
@@ -506,7 +558,7 @@ $on_mod(Loaded) {
     printf("============================================================\n");
     printf(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)\n");
     printf(" [InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)\n");
-    printf(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> 24 -> 32 -> 48 -> 54 -> 60 -> 120 -> OFF\n");
+    printf(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> 24 -> 32 -> 48 -> 54 -> 60 -> OFF\n");
     printf("============================================================\n");
 }
 
@@ -654,8 +706,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (s_sim.isSimulating()) {
-            gd::vector<GameObject*> extra;
-            extra.reserve(objectsCount);
+            // Reuse the scratch buffer across simulated ticks instead of
+            // allocating a fresh vector for every collision query.
+            static gd::vector<GameObject*> extra;
+            extra.clear();
+            if (objectsCount > 0) extra.reserve(static_cast<size_t>(objectsCount));
             for (int i = 0; i < objectsCount; i++) {
                 GameObject* obj = vec->at(i);
                 if (!obj) continue;
@@ -667,7 +722,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     extra.push_back(obj);
                 }
             }
-            GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
+            GJBaseGameLayer::collisionCheckObjects(
+                player, &extra, static_cast<int>(extra.size()), dt
+            );
             return;
         }
         GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
