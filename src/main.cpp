@@ -238,10 +238,15 @@ public:
     }
 
     int normalTicks() const { return m_maxTicksNormal; }
-    int waveTicks() const { return m_maxTicksWave; }
-    bool enabled() const { return m_enabled; }
-    bool isSimulating() const { return m_simulating; }
-    bool isFiringBuffered() const { return m_firingBuffered; }
+int waveTicks() const { return m_maxTicksWave; }
+bool enabled() const { return m_enabled; }
+
+void panicDisable() {
+    m_enabled = false;
+}
+
+bool isSimulating() const { return m_simulating; }
+bool isFiringBuffered() const { return m_firingBuffered; }
 
     bool checkSimulationDeath(PlayerObject* player) {
         if (m_simulating && (player == m_simPlayer1 || player == m_simPlayer2)) {
@@ -587,6 +592,14 @@ public:
 };
 
 static TrajectoryBufferSim s_sim;
+bool unknownBufferEnabled() {
+    return s_sim.enabled();
+}
+
+void unknownPanicDisable() {
+    s_sim.panicDisable();
+}
+
 static cocos2d::CCLabelBMFont* s_bufferHud = nullptr;
 
 static void refreshBufferHud() {
