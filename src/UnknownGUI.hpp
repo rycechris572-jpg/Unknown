@@ -2,7 +2,10 @@
 #pragma once
 
 #include <Geode/Geode.hpp>
+#include <algorithm>
 
+bool unknownBufferEnabled();
+void unknownPanicDisable();
 class UnknownGUI final : public cocos2d::CCLayer {
 public:
     static UnknownGUI* create() {
