@@ -20,12 +20,6 @@ using namespace geode::prelude;
 //  USER SETTINGS
 // ============================================================================
 
-// True Wave Spam Guard: only bypasses the buffer if you do at least
-// SPAM_STREAK_REQUIRED consecutive inputs faster than SPAM_INTERVAL_TICKS apart.
-// This keeps isolated micro-clicks and spike/sawblade dodges 100% protected!
-constexpr int SPAM_INTERVAL_TICKS = 8;
-constexpr int SPAM_STREAK_REQUIRED = 3;
-
 // Hard ceiling for every preset and every prediction scan.
 constexpr int MAX_BUFFER_TICKS = 60;
 
@@ -76,10 +70,6 @@ private:
     bool m_hasQueuedPhysicalState = false;
     bool m_lastQueuedPhysicalState = false;
     float m_frameDt = 0.25f;        // GD 240 TPS normalized dt is 0.25f
-
-    // Streak-based Spam Guard state
-    int  m_ticksSinceLastInput = 999;
-    int  m_rapidInputStreak = 0;
 
     using Clock = std::chrono::steady_clock;
     Clock::time_point m_nextPredictionAllowed{};
@@ -146,6 +136,15 @@ private:
         m_hasQueuedPhysicalState = false;
     }
 
+    // Wave fallback: preserve rapid press/release edges in the ordered queue.
+    bool deferWaveInput(PlayLayer* pl, bool push) {
+        if (!queuePhysicalInput(push)) {
+            flushPendingInputsImmediately(pl);
+            if (m_gameHolding != push) m_SimFireButton(pl, push);
+        }
+        return false;
+    }
+
     PlayerObject* createTrajectoryPlayer() {
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return nullptr;
@@ -200,8 +199,6 @@ public:
         m_gameHolding = false;
         m_simulating = false;
         m_firingBuffered = false;
-        m_ticksSinceLastInput = 999;
-        m_rapidInputStreak = 0;
     }
 
     void quit() {
@@ -216,7 +213,6 @@ public:
         m_simulating = false;
         m_firingBuffered = false;
         clearPendingInputs();
-        m_rapidInputStreak = 0;
     }
 
     // F6 cycles through nine buffer presets (capped at 60) and OFF.
@@ -253,7 +249,6 @@ public:
         // Real player died -> clear any pending buffer so respawn is 100% clean
         clearPendingInputs();
         m_gameHolding = false;
-        m_rapidInputStreak = 0;
         return false;
     }
 
@@ -412,28 +407,12 @@ public:
                 flushPendingInputsImmediately(pl);
                 if (m_gameHolding != push) m_SimFireButton(pl, push);
             }
-            m_ticksSinceLastInput = 0;
             return false;
         }
 
         bool isWave = p1->m_isDart || (isDual && p2 && p2->m_isDart);
         bool isMiniWave = (p1->m_isDart && p1->m_vehicleSize < 1.0f) ||
                           (isDual && p2 && p2->m_isDart && p2->m_vehicleSize < 1.0f);
-
-        // 3. STREAK-BASED WAVE SPAM GUARD:
-        // Only bypasses if you perform 3+ rapid inputs in a row (< 8 ticks apart).
-        // Single micro-clicks and normal Wave turns around spikes/sawblades stay 100% active!
-        if (m_ticksSinceLastInput < SPAM_INTERVAL_TICKS) {
-            m_rapidInputStreak++;
-        } else {
-            m_rapidInputStreak = 0;
-        }
-        m_ticksSinceLastInput = 0;
-
-        if (isWave && m_rapidInputStreak >= SPAM_STREAK_REQUIRED) {
-            m_gameHolding = push;
-            return true;
-        }
 
         // Only Wave (m_isDart) and Robot (m_isRobot) change trajectory on RELEASE
         bool releaseAffectsPhysics = p1->m_isDart || p1->m_isRobot ||
@@ -456,6 +435,7 @@ public:
         // prediction sweeps. Inputs inside the cooldown pass through immediately.
         const auto predictionStart = Clock::now();
         if (predictionStart < m_nextPredictionAllowed) {
+            if (isWave) return deferWaveInput(pl, push);
             m_gameHolding = push;
             return true;
         }
@@ -467,6 +447,7 @@ public:
         // If the CPU budget expires, fail open: preserve the input without buffering.
         int ticksFrame0 = getSurvivalTicks(pl, p1, p2, isDual, 0, push, targetHorizon);
         if (ticksFrame0 < 0 || m_predictionBudgetExceeded) {
+            if (isWave) return deferWaveInput(pl, push);
             m_gameHolding = push;
             return true;
         }
@@ -483,7 +464,8 @@ public:
         for (int delay = 1; delay <= maxDelayFrames; delay++) {
             int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
             if (ticks < 0 || m_predictionBudgetExceeded) {
-                // Do not use a partial scan to make a buffering decision.
+                // Do not use a partial scan. Preserve Wave edge order.
+                if (isWave) return deferWaveInput(pl, push);
                 m_gameHolding = push;
                 return true;
             }
@@ -556,10 +538,6 @@ public:
                 m_SimFireButton(pl, m_physicalHolding);
             }
             return;
-        }
-
-        if (m_ticksSinceLastInput < 999) {
-            m_ticksSinceLastInput++;
         }
 
         if (player->m_isShip || (pl->m_gameState.m_isDualMode && pl->m_player2 && pl->m_player2->m_isShip)) {
