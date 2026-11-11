@@ -1,4 +1,5 @@
 #include <Geode/Geode.hpp>
+#include "UnknownGUI.hpp"
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -604,15 +605,7 @@ static void refreshBufferHud() {
 }
 
 $on_mod(Loaded) {
-    AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
-    printf("============================================================\n");
-    printf(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)\n");
-    printf(" [InputBuffer] Starting Mode: STAGE 1 (2 All / 2 Wave)\n");
-    printf(" [InputBuffer] Press F6 in-level to cycle: 2/2 -> 4/4 -> 8/8 -> 16/8 -> 24 -> 32 -> 48 -> 54 -> 60 -> OFF\n");
-    printf("============================================================\n");
+    log::info("UNKNOWN loaded successfully.");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -625,6 +618,14 @@ class $modify(BufPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         s_sim.init();
+        // Initialize UNKNOWN GUI
+auto gui = UnknownGUI::create();
+
+if (gui) {
+    gui->setZOrder(10000);
+    this->addChild(gui);
+}
+        
         // In-level overlay; removed automatically with PlayLayer.
         auto size = cocos2d::CCDirector::sharedDirector()->getWinSize();
         s_bufferHud = cocos2d::CCLabelBMFont::create("BUFFER: 2 TICKS", "bigFont.fnt");
