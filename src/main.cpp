@@ -1,4 +1,5 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 #include "UnknownGUI.hpp"
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
@@ -608,6 +609,27 @@ $on_mod(Loaded) {
     log::info("UNKNOWN loaded successfully.");
 }
 
+static void addUnknownGUI(cocos2d::CCNode* parent) {
+    if (!parent) return;
+
+    auto gui = UnknownGUI::create();
+
+    if (gui) {
+        gui->setZOrder(10000);
+        parent->addChild(gui);
+    }
+}
+
+class $modify(BufMenuLayer, MenuLayer) {
+    bool init() {
+        if (!MenuLayer::init())
+            return false;
+
+        addUnknownGUI(this);
+        return true;
+    }
+};
+
 class $modify(BufPlayLayer, PlayLayer) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("PlayLayer::destroyPlayer", -1000000);
@@ -618,13 +640,8 @@ class $modify(BufPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         s_sim.init();
-        // Initialize UNKNOWN GUI
-auto gui = UnknownGUI::create();
-
-if (gui) {
-    gui->setZOrder(10000);
-    this->addChild(gui);
-}
+        
+addUnknownGUI(this);
         
         // In-level overlay; removed automatically with PlayLayer.
         auto size = cocos2d::CCDirector::sharedDirector()->getWinSize();
